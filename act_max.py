@@ -22,6 +22,8 @@ import scipy.misc, scipy.io
 import patchShow
 import argparse # parsing arguments
 
+import pprint
+
 mean = np.float32([104.0, 117.0, 123.0])
 
 fc_layers = ["fc6", "fc7", "fc8", "loss3/classifier", "fc1000", "prob"]
@@ -110,16 +112,33 @@ def make_step_net(net, end, unit, image, xy=0, step_size=1):
   dst = net.blobs[end]
 
   acts = net.forward(data=image, end=end)
-
-  one_hot = np.zeros_like(dst.data)
   
-  # Move in the direction of increasing activation of the given neuron
+  # Check the activations
+  topn = 5 * len(unit)
+  obj_act = []
   if end in fc_layers:
-    one_hot.flat[unit] = 1.
+    fc = acts[end][0]
+    best_unit = fc.argsort()[:-topn-1:-1]
+    for u in unit:
+      obj_act.append(fc[u])
+    
   elif end in conv_layers:
-    one_hot[:, unit, xy, xy] = 1.
-  else:
-    raise Exception("Invalid layer type!")
+    fc = acts[end][0, :, xy, xy]
+    best_unit = fc.argsort()[:-topn-1:-1]
+    for u in unit:
+      obj_act.append(fc[u])
+
+  # Move in the direction of increasing activation of the given neuron
+  one_hot = np.zeros_like(dst.data) 
+  for u in unit:
+    w = 1 if fc[u] < 10 else fc[best_unit[-1]] / fc[u]
+    w = 1 if w <= 0 else w
+    if end in fc_layers:
+      one_hot.flat[u] = w
+    elif end in conv_layers:
+      one_hot[:, u, xy, xy] = w
+    else:
+      raise Exception("Invalid layer type!")
   
   dst.diff[:] = one_hot
 
@@ -128,7 +147,6 @@ def make_step_net(net, end, unit, image, xy=0, step_size=1):
   g = diffs['data'][0]
 
   grad_norm = norm(g)
-  obj_act = 0
 
   # reset objective after each step
   dst.diff.fill(0.)
@@ -139,18 +157,8 @@ def make_step_net(net, end, unit, image, xy=0, step_size=1):
   elif grad_norm == 0:
     return 0, src.data[:].copy(), obj_act
 
-  # Check the activations
-  if end in fc_layers:
-    fc = acts[end][0]
-    best_unit = fc.argmax()
-    obj_act = fc[unit]
-    
-  elif end in conv_layers:
-    fc = acts[end][0, :, xy, xy]
-    best_unit = fc.argmax()
-    obj_act = fc[unit]
-
-  print "max: %4s [%.2f]\t obj: %4s [%.2f]\t norm: [%.2f]" % (best_unit, fc[best_unit], unit, obj_act, grad_norm)
+  formatw = lambda idx: ', '.join(['%4s:%3.2f' % (a,fc[a]) for a in idx])
+  print "obj: [%s]\t norm: [%.2f]\t topN: [%s]" % (formatw(unit), grad_norm, formatw(best_unit))
 
   # Make an update
   src.data[:] += step_size/np.abs(g).mean() * g
@@ -295,14 +303,14 @@ def activation_maximization(net, generator, gen_in_layer, gen_out_layer, start_c
 def write_label(filename, act):
   # Add activation below each image via ImageMagick
   subprocess.call(["convert %s -gravity south -splice 0x10 %s" % (filename, filename)], shell=True)
-  subprocess.call(["convert %s -append -gravity Center -pointsize %s label:\"%.2f\" -bordercolor white -border 0x0 -append %s" %
+  subprocess.call(["convert %s -append -gravity Center -pointsize %s label:\"%s\" -bordercolor white -border 0x0 -append %s" %
          (filename, 30, act, filename)], shell=True)
 
 
 def main():
 
   parser = argparse.ArgumentParser(description='Process some integers.')
-  parser.add_argument('--unit', metavar='unit', type=int, help='an unit to visualize e.g. [0, 999]')
+  parser.add_argument('--unit', metavar='unit', type=str, help='a comma-separated list of units to visualize e.g. [0, 999]')
   parser.add_argument('--n_iters', metavar='iter', type=int, default=10, help='Number of iterations')
   parser.add_argument('--L2', metavar='w', type=float, default=1.0, nargs='?', help='L2 weight')
   parser.add_argument('--start_lr', metavar='lr', type=float, default=2.0, nargs='?', help='Learning rate')
@@ -321,13 +329,16 @@ def main():
 
   args = parser.parse_args()
 
+  args.unit = [int(u) for u in args.unit.split(',')]
+  unitstr = ', '.join([str(u) for u in args.unit])
+
   # Default to constant learning rate
   if args.end_lr < 0:
     args.end_lr = args.start_lr
 
   # which neuron to visualize
   print "-------------"
-  print " unit: %s  xy: %s" % (args.unit, args.xy)
+  print " unit: %s  xy: %s" % (unitstr, args.xy)
   print " n_iters: %s" % args.n_iters
   print " L2: %s" % args.L2
   print " start learning rate: %s" % args.start_lr
@@ -348,7 +359,7 @@ def main():
   params = [
     {
       'layer': args.act_layer,
-      'iter_n': args.n_iters,
+      'iter_n': args.n_iters * len(args.unit),
       'L2': args.L2,
       'start_step_size': args.start_lr,
       'end_step_size': args.end_lr
@@ -399,7 +410,7 @@ def main():
   filename = "%s/%s_%s_%s_%s_%s__%s.jpg" % (
       args.output_dir,
       args.act_layer, 
-      str(args.unit).zfill(4), 
+      unitstr, 
       str(args.n_iters).zfill(2), 
       args.L2, 
       args.start_lr,
